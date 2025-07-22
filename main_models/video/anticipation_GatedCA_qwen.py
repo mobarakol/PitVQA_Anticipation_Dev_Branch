@@ -170,13 +170,13 @@ class PitVQAGen(nn.Module):
         fused_text_features = self.cross_attention_fusion(text_embeds, video_embeds)
         fused_embeds = fused_text_features  # [batch_size, seq_len, 1024]
         fused_att_mask = qa_att_mask  # [batch_size, seq_len]
-        print("fused_embeds shape:", fused_embeds.shape)
-        print("fused_att_mask shape:", fused_att_mask.shape)
+        #print("fused_embeds shape:", fused_embeds.shape)
+        #print("fused_att_mask shape:", fused_att_mask.shape)
         qwen_output = self.qwen(
             inputs_embeds=fused_embeds,
             attention_mask=fused_att_mask
         )
-        print("qwen_output.logits shape:", qwen_output.logits.shape)
+        #print("qwen_output.logits shape:", qwen_output.logits.shape)
         return qwen_output.logits
     
     
@@ -194,55 +194,50 @@ def train(args, train_dataloader, model, criterion, optimizer, epoch, tokenizer,
     model.train()
     total_loss = []
 
+    system_message = (
+        "You are a surgical assistant AI for endonasal pituitary surgery. "
+        "Rely on visual and textual input to deliver accurate, clinically relevant answers. "
+        "Use proper surgical terminology. There are 3 phases, 15 steps, 18 instruments and 14 surgical activities. "
+        "Time is measured in minutes. Only short sentence answers."
+    )
     for i, (images, questions, answers) in enumerate(train_dataloader, 0):
-        if images.shape[0] == 0:
-            continue  # Skip empty batch
+
         # prepare prompts
-        qa_prompt = [f'Question: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
+        qa_prompt = [f'{system_message}\nQuestion: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
         qa_prompt_inputs = tokenizer(qa_prompt, truncation=True, padding="max_length", max_length=int(args.seq_length), return_tensors="pt")
 
         # get labels
-        labels = qa_prompt_inputs['input_ids'].clone().to(device)
-        print("qa_prompt_inputs['input_ids'].shape:", qa_prompt_inputs['input_ids'].shape)
-        # mask question tokens and padding tokens, but keep answer tokens and first EOS
+        labels = qa_prompt_inputs['input_ids'].clone()
+        labels = labels.to(device)
+
+        # for labels, mask question tokens and padding tokens
         for idx, q in enumerate(questions):
-            q_prompt = f"Question: {q}\nAnswer: "
+            q_prompt = f"{system_message}\nQuestion: {q}\nAnswer: "
             q_length = len(tokenizer(q_prompt)["input_ids"]) - 1
+
             labels[idx, :q_length] = -100  # mask question
-            # mask padding tokens
-            pad_mask = (qa_prompt_inputs['attention_mask'][idx] == 0)
-            labels[idx][pad_mask] = -100
-            # keep only the first EOS, mask any after
-            eos_mask = (labels[idx] == tokenizer.eos_token_id)
-            eos_indices = torch.where(eos_mask)[0]
-            if len(eos_indices) > 1:
-                labels[idx, eos_indices[1]:] = -100
+            eos_mask = (labels[idx] == tokenizer.eos_token_id)  # get all EOS position
+            if eos_mask.sum() > 1:  # if more than 1 EOS
+                first_eos_pos = eos_mask.nonzero()[0].item()  # get first EOS position
+                labels[idx, (first_eos_pos+1):] = -100  # mask paddings, left one EOS
 
-        # Check if all labels are -100 (would cause nan loss)
+        # No need to add video token labels since we're using cross-attention fusion
+        # labels remain the same size as text sequence
 
-
+        # get logits and labels - no manual device transfer for images
         logits = model(
-            image=images,  # Model handles device transfer internally
-            qa_inputs_ids=qa_prompt_inputs['input_ids'].to(device),
-            qa_att_mask=qa_prompt_inputs['attention_mask'].to(device)
+                image=images,  # Model handles device transfer internally
+                qa_inputs_ids=qa_prompt_inputs['input_ids'].to(device),
+                qa_att_mask=qa_prompt_inputs['attention_mask'].to(device)
         )
 
         # get shifted logits and labels (standard autoregressive training)
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
-        print(f"shift_logits shape: {shift_logits.shape}")  # [batch, seq_len-1, vocab_size]
-        print(f"shift_labels shape: {shift_labels.shape}")  # [batch, seq_len-1]
 
-        # Optionally, print how many non-masked labels remain
-        print(f"Non-masked labels count: {(shift_labels != -100).sum().item()}")
-
-        # compute loss only if batch is non-empty after shifting
         shift_logits = shift_logits.view(-1, shift_logits.size(-1))
         shift_labels = shift_labels.view(-1)
-        print(f"shift_logits (flattened) shape: {shift_logits.shape}")  # [total_tokens, vocab_size]
-        print(f"shift_labels (flattened) shape: {shift_labels.shape}")  # [total_tokens]
-
         loss = criterion(shift_logits, shift_labels)
 
         optimizer.zero_grad()
@@ -255,13 +250,16 @@ def train(args, train_dataloader, model, criterion, optimizer, epoch, tokenizer,
 def validate(args, val_loader, model, criterion, epoch, tokenizer, device):
     total_loss = []
     model.eval()
-
+    system_message = (
+        "You are a surgical assistant AI for endonasal pituitary surgery. "
+        "Rely on visual and textual input to deliver accurate, clinically relevant answers. "
+        "Use proper surgical terminology. There are 3 phases, 15 steps, 18 instruments and 14 surgical activities. "
+        "Time is measured in minutes. Only short sentence answers."
+    )
     with torch.no_grad():
         for i, (images, questions, answers) in enumerate(val_loader, 0):
-            if images.shape[0] == 0:
-                continue  # Skip empty batch
             # prepare prompts
-            qa_prompt = [f'Question: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
+            qa_prompt = [f'{system_message}\nQuestion: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
             qa_prompt_inputs = tokenizer(qa_prompt, truncation=True, padding="max_length", max_length=int(args.seq_length), return_tensors="pt")
 
             # get labels
@@ -272,7 +270,7 @@ def validate(args, val_loader, model, criterion, epoch, tokenizer, device):
             answer_starts = []
             answer_ends = []
             for idx, q in enumerate(questions):
-                q_prompt = f"Question: {q}\nAnswer: "
+                q_prompt = f"{system_message}\nQuestion: {q}\nAnswer: "
                 q_length = len(tokenizer(q_prompt)["input_ids"]) - 1
                 answer_starts.append(q_length+1)
 
@@ -296,8 +294,8 @@ def validate(args, val_loader, model, criterion, epoch, tokenizer, device):
             # get shifted logits and labels (standard autoregressive training)
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            
 
+       
             shift_logits = shift_logits.view(-1, shift_logits.size(-1))
             shift_labels = shift_labels.view(-1)
             loss = criterion(shift_logits, shift_labels)
@@ -426,7 +424,7 @@ if __name__ == '__main__':
         # validation
         val_loss = validate(args, val_loader=val_dataloader, model=model, criterion=criterion,
                             epoch=epoch, tokenizer=tokenizer, device=device)
-
+        print("Validation - Epoch: {}/{}, Loss: {:.6f}".format(epoch, args.epochs, val_loss))
         if val_loss < best_val_loss:  # save model with better validation loss
             epochs_since_improvement = 0
             best_val_loss = val_loss
@@ -537,11 +535,16 @@ def calculate_time_metrics(references, hypotheses):
 def batch_greedy_search(images, questions, model, tokenizer, max_length, device):
     answers = []
     batch_size = len(questions)
-
+    system_message = (
+            "You are a surgical assistant AI for endonasal pituitary surgery. "
+            "Rely on visual and textual input to deliver accurate, clinically relevant answers. "
+            "Use proper surgical terminology. There are 3 phases, 15 steps, 18 instruments and 14 surgical activities. "
+            "Time is measured in minutes. Only short sentence answers."
+        )
     model.eval()
     with torch.no_grad():
         # Prepare the prompts for the entire batch
-        prompt_texts = [f"Question: {q}\nAnswer:" for q in questions]
+        prompt_texts = [f"{system_message}\nQuestion: {q}\nAnswer:" for q in questions]
 
         # Tokenize the prompts with padding to handle varying lengths
         prompt_inputs = tokenizer(

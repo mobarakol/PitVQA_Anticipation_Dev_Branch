@@ -107,13 +107,15 @@ def collate_qa_clipwise(batch):
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class RecurrentCrossAttentionFusion(nn.Module):
-    def __init__(self, embed_dim=768, num_heads=8, steps=3):
+    def __init__(self, embed_dim=1024, num_heads=8, steps=3):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.ln = nn.LayerNorm(embed_dim)
         self.steps = steps
 
-    def forward(self, vision_emb, text_emb):
+    def forward(self, text_emb, vision_emb):
+        # text_emb: [batch, seq_len, embed_dim]
+        # vision_emb: [batch, seq_len, embed_dim] (repeated)
         fused = text_emb
         for _ in range(self.steps):
             attended, _ = self.cross_attn(fused, vision_emb, vision_emb)
@@ -160,11 +162,10 @@ class PitVQAGen(nn.Module):
         video_embeds = video_embeds.unsqueeze(1).repeat(1, seq_len, 1)  # [batch_size, seq_len, 1024]
 
         # Text: handled by Qwen tokenizer, input is already token IDs
-        # Get Qwen's input embeddings for text
-        text_features = self.qwen.model.get_input_embeddings()(qa_inputs_ids)  # [batch_size, seq_len, 1024]
+        text_embeds = self.qwen.model.get_input_embeddings()(qa_inputs_ids)  # [batch_size, seq_len, 1024]
 
         # Fuse video and text features using cross-attention
-        fused_text_features = self.cross_attention_fusion(text_features, video_embeds)
+        fused_text_features = self.cross_attention_fusion(text_embeds, video_embeds)
         fused_embeds = fused_text_features  # [batch_size, seq_len, 1024]
         fused_att_mask = qa_att_mask  # [batch_size, seq_len]
 
@@ -191,11 +192,16 @@ def train(args, train_dataloader, model, criterion, optimizer, epoch, tokenizer,
     model.train()
     total_loss = []
 
+    system_message = (
+        "You are a surgical assistant AI for endonasal pituitary surgery. "
+        "Rely on visual and textual input to deliver accurate, clinically relevant answers. "
+        "Use proper surgical terminology. There are 3 phases, 15 steps, 18 instruments and 14 surgical activities. "
+        "Time is measured in minutes. Only short sentence answers."
+    )
     for i, (images, questions, answers) in enumerate(train_dataloader, 0):
-        if images.shape[0] == 0:
-            continue
+
         # prepare prompts
-        qa_prompt = [f'Question: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
+        qa_prompt = [f'{system_message}\nQuestion: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
         qa_prompt_inputs = tokenizer(qa_prompt, truncation=True, padding="max_length", max_length=int(args.seq_length), return_tensors="pt")
 
         # get labels
@@ -204,7 +210,7 @@ def train(args, train_dataloader, model, criterion, optimizer, epoch, tokenizer,
 
         # for labels, mask question tokens and padding tokens
         for idx, q in enumerate(questions):
-            q_prompt = f"Question: {q}\nAnswer: "
+            q_prompt = f"{system_message}\nQuestion: {q}\nAnswer: "
             q_length = len(tokenizer(q_prompt)["input_ids"]) - 1
 
             labels[idx, :q_length] = -100  # mask question
@@ -227,9 +233,7 @@ def train(args, train_dataloader, model, criterion, optimizer, epoch, tokenizer,
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
-        # compute loss only if batch is non-empty after shifting
-        if shift_logits.numel() == 0 or shift_labels.numel() == 0:
-            continue  # Skip empty batch after shifting
+
         shift_logits = shift_logits.view(-1, shift_logits.size(-1))
         shift_labels = shift_labels.view(-1)
         loss = criterion(shift_logits, shift_labels)
@@ -244,10 +248,16 @@ def train(args, train_dataloader, model, criterion, optimizer, epoch, tokenizer,
 def validate(args, val_loader, model, criterion, epoch, tokenizer, device):
     total_loss = []
     model.eval()
+    system_message = (
+        "You are a surgical assistant AI for endonasal pituitary surgery. "
+        "Rely on visual and textual input to deliver accurate, clinically relevant answers. "
+        "Use proper surgical terminology. There are 3 phases, 15 steps, 18 instruments and 14 surgical activities. "
+        "Time is measured in minutes. Only short sentence answers."
+    )
     with torch.no_grad():
         for i, (images, questions, answers) in enumerate(val_loader, 0):
             # prepare prompts
-            qa_prompt = [f'Question: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
+            qa_prompt = [f'{system_message}\nQuestion: {q}\nAnswer: {a}' for q, a in zip(questions, answers)]
             qa_prompt_inputs = tokenizer(qa_prompt, truncation=True, padding="max_length", max_length=int(args.seq_length), return_tensors="pt")
 
             # get labels
@@ -258,7 +268,7 @@ def validate(args, val_loader, model, criterion, epoch, tokenizer, device):
             answer_starts = []
             answer_ends = []
             for idx, q in enumerate(questions):
-                q_prompt = f"Question: {q}\nAnswer: "
+                q_prompt = f"{system_message}\nQuestion: {q}\nAnswer: "
                 q_length = len(tokenizer(q_prompt)["input_ids"]) - 1
                 answer_starts.append(q_length+1)
 
@@ -283,9 +293,7 @@ def validate(args, val_loader, model, criterion, epoch, tokenizer, device):
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
 
-            # compute loss only if batch is non-empty after shifting
-            if shift_logits.numel() == 0 or shift_labels.numel() == 0:
-                continue  # Skip empty batch after shifting
+       
             shift_logits = shift_logits.view(-1, shift_logits.size(-1))
             shift_labels = shift_labels.view(-1)
             loss = criterion(shift_logits, shift_labels)
@@ -311,13 +319,13 @@ def get_arg():
     parser.add_argument('--batch_size',     type=int,   default=2,   help='batch size')
     parser.add_argument('--workers',        type=int,   default=8,    help='for data-loading')
     parser.add_argument('--random_seed',    type=int,   default=42,   help='random seed')
-    parser.add_argument('--seq_length',     type=int,   default=64,   help='sequence length for question and answer')
+    parser.add_argument('--seq_length',     type=int,   default=117,   help='sequence length for question and answer')
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
 
     parser.add_argument('--dataset',        default='endo',  help='endo / pit')
     parser.add_argument('--lr',             type=float, default=2e-5,  help='0.0000001, 0.00000005')
     parser.add_argument('--checkpoint_dir', default='Cross_Attention/',  help='path to checkpoint')
-    parser.add_argument('--best_ckpt_name', default='anticipation_RecurrentCA_qwen.pth', help='best checkpoint filename')
+    parser.add_argument('--best_ckpt_name', default='anticipation_RecurrentCA_qwen_v1.pth', help='best checkpoint filename')
 
     args = parser.parse_args([])
     return args
@@ -345,8 +353,8 @@ if __name__ == '__main__':
 
     # data location - PitVQA Anticipation dataset
     train_seq = ['01', '03', '04', '05', '07']
-    # val_seq = ['02', '06', '12']
-    #train_seq = ['01', '03', '04', '05', '07', '08', '09', '10', '11', '14','15', '16', '17', '18', '19', '20', '21', '22', '23', '25']
+    # val_seq = ['02']
+    # train_seq = ['01']
     val_seq = ['02', '06', '12','13', '24']    
     image_root = '/SAN/medic/surgicalLLM/content/PitVQA/datasets/PitVQA_Anticipation-25/images'
     qa_root = '/SAN/medic/surgicalLLM/content/PitVQA/datasets/PitVQA_Anticipation-25/QA_Anticipation'
@@ -414,6 +422,7 @@ if __name__ == '__main__':
         # validation
         val_loss = validate(args, val_loader=val_dataloader, model=model, criterion=criterion,
                             epoch=epoch, tokenizer=tokenizer, device=device)
+        print(f"Validation - Epoch: {epoch}/{args.epochs}, Loss: {val_loss:.6f}")  # <-- Add this line
 
         if val_loss < best_val_loss:  # save model with better validation loss
             epochs_since_improvement = 0
@@ -526,10 +535,16 @@ def batch_greedy_search(images, questions, model, tokenizer, max_length, device)
     answers = []
     batch_size = len(questions)
 
+    system_message = (
+        "You are a surgical assistant AI for endonasal pituitary surgery. "
+        "Rely on visual and textual input to deliver accurate, clinically relevant answers. "
+        "Use proper surgical terminology. There are 3 phases, 15 steps, 18 instruments and 14 surgical activities. "
+        "Time is measured in minutes. Only short sentence answers."
+    )
     model.eval()
     with torch.no_grad():
         # Prepare the prompts for the entire batch
-        prompt_texts = [f"Question: {q}\nAnswer:" for q in questions]
+        prompt_texts = [f"{system_message}\nQuestion: {q}\nAnswer:" for q in questions]
 
         # Tokenize the prompts with padding to handle varying lengths
         prompt_inputs = tokenizer(
@@ -669,11 +684,11 @@ references, hypotheses  = inference(args, val_loader=val_dataloader, model=model
 mse, mae, valid_pairs_count = calculate_time_metrics(references, hypotheses)
 
 # Save references and hypotheses to files (similar to endovis_llama_v4.py)
-with open(f'{args.checkpoint_dir}/RecurrentCA_qwen_ref.txt', 'w') as f:
+with open(f'{args.checkpoint_dir}/RecurrentCA_qwen_v1_ref.txt', 'w') as f:
     for ref in references:
         f.write(ref + '\n')
 
-with open(f'{args.checkpoint_dir}/RecurrentCA_qwen_hyp.txt', 'w') as f:
+with open(f'{args.checkpoint_dir}/RecurrentCA_qwen_v1_hyp.txt', 'w') as f:
     for hyp in hypotheses:
         f.write(hyp + '\n')
 
